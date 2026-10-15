@@ -1,0 +1,142 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+# flex and bison give fio arithmetic in option values.
+RUN apk add --no-cache \
+      bison \
+      build-base \
+      ca-certificates \
+      flex \
+      git \
+      libaio-dev \
+      linux-headers \
+      numactl-dev \
+      scanelf \
+      zlib-dev
+
+# fio's GitHub releases carry only Windows installers, so the release tag is
+# cloned and must point to the commit pinned in package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "fio-${VERSION}" \
+      https://github.com/axboe/fio.git /src/fio; \
+    test "$(git -C /src/fio rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag fio-${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }
+WORKDIR /src/fio
+ARG JOBS
+# configure adds -march=native unless --disable-native is given, which would
+# tie the binaries to the CPU of the build runner. The engines that need
+# libraries this stage does not install are turned off by name, so that the
+# result does not depend on what the base image carries. fio takes its version
+# from git describe and appends -dirty when a tracked file was changed, so the
+# tree is built as cloned and the version is checked afterwards.
+# configure turns on arithmetic only when a program that calls yywrap links
+# with -lfl or -ll. flex's libfl.so leaves yylex undefined, so that link fails
+# against it. A static libl.a that holds only yywrap is built for configure and
+# the fio link instead, and fio loads no libfl at run time.
+RUN set -- \
+      --prefix=/usr/local \
+      --disable-native \
+      --disable-dfs \
+      --disable-gfapi \
+      --disable-http \
+      --disable-isal \
+      --disable-isal64 \
+      --disable-libblkio \
+      --disable-libnfs \
+      --disable-libzbc \
+      --disable-pmem \
+      --disable-rados \
+      --disable-rbd \
+      --disable-rdma \
+      --disable-tcmalloc \
+      --disable-xnvme \
+      --extra-ldflags=-L/tmp/lexlib; \
+    mkdir -p /tmp/lexlib; \
+    printf 'int yywrap(void) { return 1; }\n' > /tmp/lexlib/yywrap.c; \
+    cc -O2 -c -o /tmp/lexlib/yywrap.o /tmp/lexlib/yywrap.c; \
+    ar rcs /tmp/lexlib/libl.a /tmp/lexlib/yywrap.o; \
+    echo "$*" > /tmp/configure-options; \
+    ./configure "$@" | tee /tmp/configure.log; \
+    missing=; \
+    for sym in CONFIG_LIBAIO CONFIG_LIBNUMA CONFIG_ZLIB CONFIG_ARITHMETIC CONFIG_MTD CONFIG_STRLCAT; do \
+      grep -qx "${sym}=y" config-host.mak || missing="$missing ${sym}"; \
+    done; \
+    if [ -n "$missing" ]; then echo "configure did not set:$missing" >&2; exit 1; fi; \
+    if grep -q '^CONFIG_BUILD_NATIVE=' config-host.mak; then echo "configure turned on -march=native" >&2; exit 1; fi; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make install DESTDIR=/out; \
+    out=/out/usr/local; \
+    for f in fio_generate_plots fio2gnuplot genfio fiologparser.py fiologparser_hist.py fio-histo-log-pctiles.py \
+        fio_jsonplus_clat2csv; do \
+      rm "$out/bin/$f"; \
+    done; \
+    rm -r "$out/share/man" "$out/share/fio"; \
+    for f in "$out"/bin/*; do echo "${f##*/}"; done | LC_ALL=C sort | tr '\n' ' ' > /tmp/programs; \
+    test "$(cat /tmp/programs)" = 'fio fio-btrace2fio fio-dedupe fio-genzipf fio-verify-state ' \
+      || { echo "unexpected programs: $(cat /tmp/programs)" >&2; exit 1; }; \
+    strip "$out"/bin/*; \
+    "$out/bin/fio" --version > /tmp/fio-version; \
+    test "$(cat /tmp/fio-version)" = "fio-${VERSION}" || { echo "unexpected version: $(cat /tmp/fio-version)" >&2; exit 1; }
+
+ARG BASE_IMAGE
+# xxHash and lib/ieee754.c keep their notices in the source files, so those are
+# cut from the first comment that holds them. runtime-deps lists the so: names
+# fio needs, plus the packages in runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/fio; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYING MORAL-LICENSE "$meta/licenses/"; \
+    grep -q 'GNU GENERAL PUBLIC LICENSE' "$meta/licenses/COPYING"; \
+    notice() { \
+      awk -v pat="$2" '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ pat) { printf "%s", b; exit } }' \
+        "$1" > "$meta/licenses/NOTICE.$3"; \
+      test -s "$meta/licenses/NOTICE.$3" || { echo "no notice in $1" >&2; exit 1; }; \
+    }; \
+    notice crc/xxhash.c 'BSD 2-Clause' xxhash; \
+    notice lib/ieee754.c 'public domain' ieee754; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/axboe/fio.git@${SOURCE_COMMIT}" \
+      "https://github.com/axboe/fio/tree/${SOURCE_COMMIT}" \
+      "https://github.com/randomcontainers/fio/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "configure: $(cat /tmp/configure-options)"; \
+      grep -E '^(CPU|zlib|Linux AIO support|libnuma|MTD|lex/yacc for arithmetic|march_armv8_a_crc_crypto|Build march=native) ' \
+        /tmp/configure.log; \
+      cat /tmp/fio-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | sort -u > /tmp/needed; \
+    for so in libaio.so.1 libnuma.so.1 libz.so.1; do \
+      grep -qx "$so" /tmp/needed || { echo "fio does not load $so" >&2; cat /tmp/needed >&2; exit 1; }; \
+    done; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/fio/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "fio"]
+CMD ["--help"]
