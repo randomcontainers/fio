@@ -1,0 +1,126 @@
+name: fio
+title: fio
+summary: Flexible I/O tester that benchmarks disks, file systems and storage volumes, with the libaio and io_uring engines and a client/server mode.
+homepage: https://github.com/axboe/fio
+# fio (GPL-2.0-only) and the code it compiles in from other projects: the
+# CRC32, CRC32C, CRC-T10DIF, SHA-256, SHA-512 and SHA-3 code, rbtree, fifo and
+# MTD files (GPL-2.0-or-later) and xxHash (BSD-2-Clause). lib/ieee754.c is in
+# the public domain.
+license: GPL-2.0-only AND GPL-2.0-or-later AND BSD-2-Clause
+source-release: true
+upstream:
+  source: github-tag
+  repository: axboe/fio
+  # Release tags look like fio-3.43. Every 3.x tag has two parts; the old 1.x
+  # and 2.x tags (fio-2.2.13, fio-1.50-rc4) do not match, and neither would a
+  # fio-4.0: widen the pattern then. The "fio-3." outside the group limits the
+  # tag lookup to tags that start with it.
+  tag-pattern: '^fio-3\.(\d+)$'
+  version-template: '3.{1}'
+  versioning: semver
+  version: "3.43"
+  # fio's GitHub releases carry only Windows installers, so the build clones
+  # the tag.
+  git:
+    url: https://github.com/axboe/fio.git
+    tag: fio-{version}
+    commit: d2dcd7e053d1902d2420f151c83990e6acdd9f8c
+image:
+  entrypoint: [fio]
+  cmd: [--help]
+test:
+  - |
+    fio --version > version.txt
+    test "$(cat version.txt)" = "fio-$VERSION" || { echo "expected fio-$VERSION, got: $(cat version.txt)" >&2; exit 1; }
+    fio --enghelp > engines.txt
+    for e in psync libaio io_uring posixaio mmap sg mtd net null; do
+      awk -v e="$e" '$1 == e { f = 1 } END { exit !f }' engines.txt || { echo "engine $e is missing from:" >&2; cat engines.txt >&2; exit 1; }
+    done
+    # Without libnuma, fio lists the NUMA options as unsupported.
+    fio --cmdhelp=numa_cpu_nodes > numa.txt
+    grep -Fq 'numa_cpu_nodes: NUMA CPU nodes bind' numa.txt || { echo 'fio was built without libnuma:' >&2; cat numa.txt >&2; exit 1; }
+    for p in fio-btrace2fio fio-dedupe fio-genzipf fio-verify-state; do
+      command -v "$p" > /dev/null || { echo "$p is missing" >&2; exit 1; }
+    done
+    fio-genzipf -t zipf -i 1.2 -g 1 -b 4096 > zipf.txt
+    head -n 1 zipf.txt | grep -Fqx 'Generating Zipf distribution with 1.200000 input and 1 GiB size and 4096 block_size.' \
+      || { echo 'unexpected fio-genzipf output:' >&2; head -n 3 zipf.txt >&2; exit 1; }
+    grep -q '^Total' zipf.txt || { cat zipf.txt >&2; exit 1; }
+  - |
+    # The smoke test that upstream's make test runs: a null engine job and a
+    # small write with crc32c verification.
+    fio --minimal --thread --exitall_on_error --runtime=1s --name=nulltest --ioengine=null --rw=randrw --iodepth=2 \
+      --norandommap --random_generator=tausworthe64 --size=16T --name=verifyfstest --filename=fiotestfile.tmp --unlink=1 \
+      --rw=write --verify=crc32c --verify_state_save=0 --size=16K > smoke.txt 2> smoke.err \
+      || { cat smoke.txt smoke.err >&2; exit 1; }
+    for job in nulltest verifyfstest; do
+      awk -F ';' -v v="fio-$VERSION" -v job="$job" '$2 == v && $3 == job && $5 == 0 { f = 1 } END { exit !f }' smoke.txt \
+        || { echo "expected a terse result without errors for $job in:" >&2; cat smoke.txt >&2; exit 1; }
+    done
+  - |
+    # Prints a field from the read or write section of the first job in a JSON result.
+    field() {
+      awk -v dir="\"$2\" : {" -v key="\"$3\" :" \
+        'index($0, dir) { d = 1 } d && index($0, key) { sub(/.*: /, ""); sub(/,$/, ""); print; exit }' "$1"
+    }
+    check() {
+      got="$(field "$1" "$2" "$3")"
+      test "$got" = "$4" || { echo "$1: expected $2 $3 $4, got '$got'" >&2; cat "$1" >&2; exit 1; }
+    }
+    fio --name=w --filename=w.bin --ioengine=psync --rw=write --bs=4k --size=8M --verify=crc32c --do_verify=1 \
+      --output-format=json --output=w.json || { cat w.json >&2; exit 1; }
+    check w.json write io_bytes 8388608
+    # A write job with verification saves its state for a later verify-only run.
+    set -- local-w-*-verify.state
+    test -f "$1" || { echo 'no verify state file in:' >&2; ls -l >&2; exit 1; }
+    fio-verify-state "$1" > state.txt
+    grep -Eq '^Name:[[:space:]]+w$' state.txt || { echo 'unexpected verify state:' >&2; cat state.txt >&2; exit 1; }
+    # Docker's default seccomp profile allows the libaio system calls.
+    fio --name=r --filename=r.bin --ioengine=libaio --iodepth=8 --rw=randread --bs=4k --size=8M \
+      --output-format=json --output=r.json || { cat r.json >&2; exit 1; }
+    check r.json read io_bytes 8388608
+    # A value in parentheses is an arithmetic expression, which needs fio built with lex and yacc.
+    fio --name=e --ioengine=null --rw=write --bs=4k --size='(1024*1024)' --output-format=json --output=e.json \
+      || { cat e.json >&2; exit 1; }
+    check e.json write total_ios 256
+  - |
+    # log_store_compressed writes the log through zlib, and --inflate-log reads it back.
+    fio --name=lat --filename=lat.bin --ioengine=psync --rw=write --bs=4k --size=1M \
+      --write_lat_log=lat --log_store_compressed=1 --output=lat.txt || { cat lat.txt >&2; exit 1; }
+    test -s lat_clat.1.log.fz || { echo 'no compressed clat log in:' >&2; ls -l >&2; exit 1; }
+    fio --inflate-log=lat_clat.1.log.fz > clat.log
+    # One line per write: time, latency, direction (1 is write), block size, priority.
+    awk -F ', ' '$3 != 1 || $4 != 4096 { bad++ } END { exit bad || NR != 256 }' clat.log \
+      || { echo "expected 256 writes of 4096 bytes, got $(wc -l < clat.log) lines:" >&2; head -n 5 clat.log >&2; exit 1; }
+  - |
+    # A server on the loopback interface runs the job file that a client sends it.
+    fio --server=ip:127.0.0.1,8765 > server.log 2>&1 &
+    server=$!
+    tries=0
+    # 0100007F:223D is 127.0.0.1:8765 in /proc/net/tcp, and state 0A is LISTEN.
+    until awk '$2 == "0100007F:223D" && $4 == "0A" { f = 1 } END { exit !f }' /proc/net/tcp; do
+      tries=$((tries + 1))
+      if [ "$tries" -gt 20 ]; then cat server.log >&2; exit 1; fi
+      sleep 1
+    done
+    printf '%s\n' '[cs]' 'ioengine=psync' 'rw=write' 'bs=4k' 'size=1M' 'filename=cs.bin' > cs.fio
+    status=0
+    fio --output-format=json --output=cs.json --client=127.0.0.1,8765 cs.fio > client.log 2>&1 || status=$?
+    # The server exits on SIGTERM only when the signal interrupts its poll() call, so use SIGKILL.
+    kill -9 "$server" 2> /dev/null || true
+    wait "$server" || true
+    if [ "$status" -ne 0 ]; then cat client.log cs.json server.log >&2; exit 1; fi
+    grep -Fq '"hostname" : "127.0.0.1"' cs.json || { echo 'no result from the server in:' >&2; cat cs.json >&2; exit 1; }
+    bytes="$(awk 'index($0, "\"write\" : {") { d = 1 } d && index($0, "\"io_bytes\" :") { sub(/.*: /, ""); sub(/,$/, ""); print; exit }' cs.json)"
+    test "$bytes" = 1048576 || { echo "expected 1048576 bytes written, got '$bytes'" >&2; cat cs.json >&2; exit 1; }
+examples:
+  - title: Measure random 4 KiB reads and writes on a 1 GiB file in the current directory for 60 seconds
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/fio --name=randrw --filename=fio.dat --size=1G --rw=randrw --bs=4k --ioengine=libaio --iodepth=32 --direct=1 --runtime=60 --time_based
+  - title: Run a job file and write the results as JSON
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/fio --output-format=json --output=result.json job.fio
+  - title: Measure sequential reads from a block device without writing to it
+    command: docker run --rm --user 0:0 --device /dev/nvme1n1 ghcr.io/randomcontainers/fio --readonly --name=seqread --filename=/dev/nvme1n1 --rw=read --bs=1M --ioengine=libaio --iodepth=16 --direct=1 --runtime=30 --time_based
+  - title: Start a server for fio clients against /mnt/data; publish its port only on a trusted network
+    command: docker run --rm -p <address>:8765:8765 --user "$(id -u):$(id -g)" -v /mnt/data:/work ghcr.io/randomcontainers/fio --server
+  - title: Use the io_uring engine, which Docker's default seccomp profile blocks
+    command: docker run --rm --security-opt seccomp=unconfined --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/fio --name=uring --filename=fio.dat --size=1G --rw=randread --bs=4k --ioengine=io_uring --iodepth=32 --direct=1 --runtime=60 --time_based
